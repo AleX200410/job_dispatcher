@@ -7,6 +7,7 @@
 
 enum {PRIMES,PRIMEDIVISORS,ANAGRAMS,END};
 int *occupied_servers = NULL;
+int comm_sz,end =0;
 sem_t sem;
 
 typedef struct {
@@ -86,19 +87,50 @@ char *anagrams(char *name){
 }
 
 void *receive_results(void *arg){
-    FILE *g = (FILE *)arg;
+    FILE *log_file = (FILE *)arg;
+    FILE *out[comm_sz+1];
     int *result;
-    while(1){
-//        MPI_recv(result,1,MPI_INT,MPI_ANY_SOURCE,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-//        fprintf(g,"%d\n",*result);
+    int count,sem_value=0;
+    char output_path[20],*anagrams_result = NULL;
+    MPI_Status status;
+
+    for(int i=1;i<=comm_sz;i++){  ///trebuie pe client nu pe server 
+        if((out[i] = fopen("log.txt","w")) == NULL){
+            printf("Problem opening output file\n");
+            exit(1);
+        }    
+    }
+
+    while(!end || sem_value != comm_sz-1){
+
+        MPI_Probe(MPI_ANY_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,&status);
+        switch(status.MPI_TAG){
+            case PRIMES:
+                MPI_Recv(result,1,MPI_INT,status.MPI_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                sem_post(&sem);
+                break;
+            case PRIMEDIVISORS:
+                MPI_Recv(result,1,MPI_INT,status.MPI_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                sem_post(&sem);
+                break;
+            case ANAGRAMS:
+                MPI_Get_count(&status,MPI_INT,&count);
+                anagrams_result = (char*)malloc(count + 1);
+                MPI_Recv(anagrams_result,count,MPI_CHAR,status.MPI_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
+                sem_post(&sem);
+
+                free(anagrams_result);
+        }
+        
+        sem_getvalue(&sem,&sem_value);
     }
 
     return NULL;
 }
 
-void send_request(server_request request,int n, MPI_Datatype MPI_server_request){
+void send_request(server_request request, MPI_Datatype MPI_server_request){
     sem_wait(&sem);
-    for(int i=1; i<n; i++){
+    for(int i=1; i<comm_sz; i++){
         if(!occupied_servers[i]){
             MPI_Send(&request,1,MPI_server_request,i,0,MPI_COMM_WORLD);
             occupied_servers[i] = 0;
@@ -108,7 +140,7 @@ void send_request(server_request request,int n, MPI_Datatype MPI_server_request)
     }
 }
 
-void main_server(FILE *f, FILE *g, int comm_sz, MPI_Datatype MPI_server_request){
+void main_server(FILE *f, FILE *log_file, MPI_Datatype MPI_server_request){
     char command[100];
     char *token,*request_type,*request_argument;
     int sleep_amount;        
@@ -117,13 +149,13 @@ void main_server(FILE *f, FILE *g, int comm_sz, MPI_Datatype MPI_server_request)
 
     sem_init(&sem,0,comm_sz-1);
 
-    occupied_servers = (int*)calloc(comm_sz,sizeof(int));
+    occupied_servers = (int*)calloc(comm_sz+1,sizeof(int));
     if(occupied_servers == NULL){
         perror("memory allocation");
         exit(1);
     }
 
-    if(pthread_create(th,NULL,receive_results,(void *)g) != 0){
+    if(pthread_create(th,NULL,receive_results,(void *)log_file) != 0){
         perror("creating thread");
         exit(1);
     }
@@ -142,19 +174,19 @@ void main_server(FILE *f, FILE *g, int comm_sz, MPI_Datatype MPI_server_request)
                 request.type = PRIMES;
                 request.N = atoi(request_argument);
                 request.name[0] = '\0';
-                send_request(request,comm_sz,MPI_server_request);
+                send_request(request,MPI_server_request);
             }
             else if(strcmp(request_type,"PRIMEDIVISORS") == 0){
                 request.type = PRIMEDIVISORS;
                 request.N = atoi(request_argument);
                 request.name[0] = '\0';
-                send_request(request,comm_sz,MPI_server_request);
+                send_request(request,MPI_server_request);
             }
             else if(strcmp(request_type,"ANAGRAMS") == 0){
                 request.type = ANAGRAMS;    
                 request.N = 0;
                 strncpy(request.name,request_argument,9);
-                send_request(request,comm_sz,MPI_server_request);
+                send_request(request,MPI_server_request);
             }
             else{
                 printf("Unknown command %s %s %s\n",token,request_type,request_argument);
@@ -163,12 +195,17 @@ void main_server(FILE *f, FILE *g, int comm_sz, MPI_Datatype MPI_server_request)
         }
     }
 
+    end = 1;
+    request.type = END;
+    for(int i = 1;i < comm_sz;i++)
+        MPI_Send(&request,1,MPI_server_request,i,0,MPI_COMM_WORLD);
+
     sem_destroy(&sem);
     free(occupied_servers);
     pthread_join(th,NULL);
 }
 
-void worker_server(MPI_Datatype MPI_server_request){
+void worker_server(MPI_Datatype MPI_server_request,int my_rank){
     server_request request;
     int end = 0, result=0;
     char *anagrams_result = NULL;
@@ -194,18 +231,19 @@ void worker_server(MPI_Datatype MPI_server_request){
                 break;
         }
         if(request.type == ANAGRAMS){
-            MPI_Send(&anagrams_result,nr_bytes,MPI_CHAR,0,ANAGRAMS,MPI_COMM_WORLD);
+            MPI_Send(anagrams_result,nr_bytes,MPI_CHAR,0,ANAGRAMS,MPI_COMM_WORLD);
             free(anagrams_result);        
         }
         else
             MPI_Send(&result,1,MPI_INT,0,request.type,MPI_COMM_WORLD);
 
     }
+
 }
 
 int main(int argc, char **argv){
-    int my_rank, comm_sz, block_counts[3];
-    FILE *f,*g;
+    int my_rank, block_counts[3];
+    FILE *f,*log_file;
     MPI_Datatype MPI_server_request,old_types[3];
     MPI_Aint offsets[3];
 
@@ -238,16 +276,16 @@ int main(int argc, char **argv){
             printf("Problem opening input file\n");
             exit(1);
         }
-        if((g = fopen("output.txt","w")) == NULL){
+        if((log_file = fopen("log.txt","w")) == NULL){
             printf("Problem opening output file\n");
             exit(1);
         }
-        main_server(f,g,comm_sz,MPI_server_request);
+        main_server(f,log_file,MPI_server_request);
         fclose(f);
-        fclose(g);
+        fclose(log_file);
     }
     else
-        worker_server(MPI_server_request);
+        worker_server(MPI_server_request,my_rank);
 
     MPI_Type_free(&MPI_server_request);
     MPI_Finalize();
