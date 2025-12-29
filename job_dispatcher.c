@@ -5,18 +5,34 @@
 #include <string.h>
 #include <semaphore.h>
 #include <unistd.h>
+#include <time.h>
 
-enum {PRIMES,PRIMEDIVISORS,ANAGRAMS,END};
-int *occupied_servers = NULL;
-int comm_sz,end =0;
-sem_t sem;
-pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+#define MAX_COMMAND_LENGTH 50
 
 typedef struct {
     int type;  
     int N;
     char name[9];
 }server_request;
+
+typedef struct node{
+    char command[MAX_COMMAND_LENGTH];
+    double time;
+    int type;
+    struct node *next;
+}queue_node;
+
+enum {PRIMES,PRIMEDIVISORS,ANAGRAMS,END};
+enum {RECEIVED,DISPATCHED,FINISHED};
+int *occupied_servers = NULL;
+char *commands_per_server = NULL;
+int comm_sz,end =0;
+double time_start;
+sem_t sem;
+pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+queue_node *head = NULL;
+queue_node *tail = NULL;
+pthread_cond_t not_empty;
 
 int factorial(int n){
     int result = 1;
@@ -74,7 +90,7 @@ void permute(char *temp, char *name, int l, int r){
     }
 }
 
-char *anagrams(char *name){  //TO DO: fix, doesn't work, 
+char *anagrams(char *name){  
     int n = strlen(name);
     char *temp;
     temp = (char*)malloc(sizeof(char) * (n+1) * (factorial(n)));
@@ -88,19 +104,90 @@ char *anagrams(char *name){  //TO DO: fix, doesn't work,
     return temp;
 }
 
+int isEmpty(){
+    return (head == NULL);
+}
+
+void enqueue(char command[],struct timespec t,int type){
+    double time = t.tv_sec + t.tv_nsec / 1000000000.0;
+    time -= time_start;    
+    struct node *new = malloc(sizeof(struct node));
+    
+    pthread_mutex_lock(&queue_mutex);
+    strcpy(new->command,command);
+    new->time = time;
+    new->type = type;
+    new->next = NULL;
+
+    if (!isEmpty())
+    {
+        tail->next = new;
+        tail = new;
+    }
+    else
+    {
+        head = new;
+        tail = new;
+    }
+
+    pthread_cond_signal(&not_empty);
+    pthread_mutex_unlock(&queue_mutex);
+}
+
+void *log_function(void *arg){
+    FILE *log_file = (FILE *)arg;
+    struct node *oldhead;
+
+    while(end != 2){
+        pthread_mutex_lock(&queue_mutex);
+
+        while (isEmpty() && end != 2)
+            pthread_cond_wait(&not_empty, &queue_mutex);
+
+        if(end == 2){
+            pthread_mutex_unlock(&queue_mutex);
+            return NULL;
+        }
+
+        oldhead = head;
+        head = head->next;
+        if (head == NULL)
+            tail = NULL;
+        	
+        pthread_mutex_unlock(&queue_mutex);
+
+        switch(oldhead->type){
+            case RECEIVED:
+                fprintf(log_file,"%f: %s RECEIVED\n",oldhead->time,oldhead->command);
+                break;
+            case DISPATCHED:
+                fprintf(log_file,"%f: %s DISPATCHED\n",oldhead->time,oldhead->command);
+                break;
+            case FINISHED:
+                fprintf(log_file,"%f: %s FINISHED\n",oldhead->time,oldhead->command);
+                break;
+        }
+        free(oldhead);
+    }
+
+    return NULL;
+}
+
 void *receive_results(void *arg){
-//    FILE *log_file = (FILE *)arg;
     FILE *out;
     int result;
 //    int count;
     int sem_value=0;
     char output_path[20],*anagrams_result = NULL;
     MPI_Status status;
+    struct timespec time;
 
     while(!end || sem_value != comm_sz-1){
         MPI_Probe(MPI_ANY_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,&status);
-        printf("doing stuff\n");
-        fflush(stdout);
+//        printf("doing stuff\n");
+//        fflush(stdout);
+        clock_gettime(CLOCK_MONOTONIC,&time);
+        enqueue(&commands_per_server[status.MPI_SOURCE * MAX_COMMAND_LENGTH],time,FINISHED);
 
         sprintf(output_path,"output_client%d.txt",occupied_servers[status.MPI_SOURCE]);
         if((out = fopen(output_path,"a")) == NULL){
@@ -131,28 +218,34 @@ void *receive_results(void *arg){
         sem_getvalue(&sem,&sem_value);
     }
 
+    end = 2;
+    pthread_cond_signal(&not_empty);
+
     return NULL;
 }
 
-void send_request(server_request request, MPI_Datatype MPI_server_request,int client_id){
+void send_request(server_request request, MPI_Datatype MPI_server_request,int client_id,char original_command[]){
     sem_wait(&sem);
     for(int i=1; i<comm_sz; i++){
         if(occupied_servers[i] == -1){
             MPI_Send(&request,1,MPI_server_request,i,0,MPI_COMM_WORLD);
             occupied_servers[i] = client_id;
+            strcpy(&commands_per_server[i*MAX_COMMAND_LENGTH],original_command);
             break;
         }
     }
 }
 
 void main_server(FILE *f, FILE *log_file, MPI_Datatype MPI_server_request){
-    char command[100];
+    char command[MAX_COMMAND_LENGTH],original_command[MAX_COMMAND_LENGTH];
     char *token,*request_type,*request_argument;
-    int sleep_amount;        
-    pthread_t th;
+    int sleep_amount,unknown_command = 0;        
+    pthread_t th[2];
     server_request request;
+    struct timespec time;
 
-    pthread_mutex_init(&mutex,NULL);
+    pthread_mutex_init(&queue_mutex,NULL);
+    pthread_cond_init(&not_empty,NULL);
     sem_init(&sem,0,comm_sz-1);
 
     occupied_servers = (int*)malloc((comm_sz+1) * sizeof(int));
@@ -160,14 +253,33 @@ void main_server(FILE *f, FILE *log_file, MPI_Datatype MPI_server_request){
         perror("memory allocation");
         MPI_Abort(MPI_COMM_WORLD,2);
     }
+    commands_per_server = (char*)malloc((comm_sz+1) * MAX_COMMAND_LENGTH * sizeof(char));
+    if(occupied_servers == NULL){
+        perror("memory allocation");
+        MPI_Abort(MPI_COMM_WORLD,2);
+    }
+
     memset(occupied_servers,-1,(comm_sz+1) * sizeof(int));
 
-    if(pthread_create(&th,NULL,receive_results,(void *)log_file) != 0){
+    if(pthread_create(&th[0],NULL,receive_results,NULL) != 0){
         perror("creating thread");
         MPI_Abort(MPI_COMM_WORLD,3);
     }
 
-    while(fgets(command,99,f) != NULL){
+    if(pthread_create(&th[1],NULL,log_function,(void *)log_file) != 0){
+        perror("creating thread");
+        MPI_Abort(MPI_COMM_WORLD,3);
+    }
+
+    while(fgets(command,49,f) != NULL){
+        clock_gettime(CLOCK_MONOTONIC,&time);
+
+        if(strcmp(command,"\n") == 0)
+            continue;
+
+        command[strlen(command)-1] = '\0';
+        strcpy(original_command,command);
+        
         token = strtok(command," ");
         if(strcmp(token, "WAIT") == 0){
             token =  strtok(NULL," ");
@@ -175,31 +287,36 @@ void main_server(FILE *f, FILE *log_file, MPI_Datatype MPI_server_request){
             sleep(sleep_amount);
         }
         else{
+            enqueue(original_command,time,RECEIVED);
             request_type = strtok(NULL," ");
             request_argument = strtok(NULL, " ");
             if(strcmp(request_type,"PRIMES") == 0){
                 request.type = PRIMES;
                 request.N = atoi(request_argument);
                 request.name[0] = '\0';
-                send_request(request,MPI_server_request,atoi(token+3));
             }
             else if(strcmp(request_type,"PRIMEDIVISORS") == 0){
                 request.type = PRIMEDIVISORS;
                 request.N = atoi(request_argument);
-                request.name[0] = '\0';
-                send_request(request,MPI_server_request,atoi(token+3));
+                request.name[0] = '\0';               
             }
             else if(strcmp(request_type,"ANAGRAMS") == 0){
                 request.type = ANAGRAMS;    
                 request.N = 0;
                 request_argument[strlen(request_argument)-1] = '\0';
                 strncpy(request.name,request_argument,8);
-                request.name[8]='\0';
-                send_request(request,MPI_server_request,atoi(token+3));
+                request.name[8]='\0';               
             }
             else{
+                unknown_command = 1;
                 printf("Unknown command %s %s %s\n",token,request_type,request_argument);
                 fflush(stdout);
+            }
+
+            if(!unknown_command){
+                send_request(request,MPI_server_request,atoi(token+3),original_command);
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                enqueue(original_command,time,DISPATCHED);
             }
         }
     }
@@ -209,9 +326,13 @@ void main_server(FILE *f, FILE *log_file, MPI_Datatype MPI_server_request){
     for(int i = 1;i < comm_sz;i++)
         MPI_Send(&request,1,MPI_server_request,i,0,MPI_COMM_WORLD);
 
-    pthread_join(th,NULL);
+    pthread_join(th[0],NULL);
+    pthread_join(th[1],NULL);
     sem_destroy(&sem);
+    pthread_mutex_destroy(&queue_mutex);
+    pthread_cond_destroy(&not_empty);
     free(occupied_servers);
+    free(commands_per_server);
 }
 
 void worker_server(MPI_Datatype MPI_server_request,int my_rank){
@@ -259,6 +380,8 @@ int main(int argc, char **argv){
     FILE *f,*log_file;
     MPI_Datatype MPI_server_request,old_types[3];
     MPI_Aint offsets[3];
+    struct timespec start,finish;
+    double total_time;
 
     if(argc < 2){
         printf("No input file\n");
@@ -285,9 +408,9 @@ int main(int argc, char **argv){
     MPI_Type_create_struct(3,block_counts,offsets,old_types,&MPI_server_request);
     MPI_Type_commit(&MPI_server_request);
 
-
-
     if(my_rank == 0){
+        clock_gettime(CLOCK_MONOTONIC,&start);
+        time_start = start.tv_sec + start.tv_nsec / 1000000000.0;   
         if((f = fopen(argv[1],"r")) == NULL){
             printf("Problem opening input file\n");
             MPI_Abort(MPI_COMM_WORLD,1);
@@ -299,13 +422,17 @@ int main(int argc, char **argv){
         main_server(f,log_file,MPI_server_request);
         fclose(f);
         fclose(log_file);
+        clock_gettime(CLOCK_MONOTONIC,&finish);
+        total_time = (finish.tv_sec - start.tv_sec);
+        total_time += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+        printf("Parallel time: %f\n",total_time);
     }
     else
         worker_server(MPI_server_request,my_rank);
 
-    printf("succes exit yay %d\n",my_rank);
     MPI_Type_free(&MPI_server_request);
     MPI_Finalize();
     
     return 0;
 }
+
