@@ -8,6 +8,13 @@
 #include <time.h>
 
 #define MAX_COMMAND_LENGTH 50
+//#define SERIAL
+
+/*
+result for example input file in problem assignment without WAIT with 4 processes (assuming you can't append existing output files and new ones need to be)
+parallel = 7.53 
+serial = 14.68
+*/
 
 typedef struct {
     int type;  
@@ -184,36 +191,40 @@ void *receive_results(void *arg){
 
     while(!end || sem_value != comm_sz-1){
         MPI_Probe(MPI_ANY_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,&status);
-//        printf("doing stuff\n");
-//        fflush(stdout);
         clock_gettime(CLOCK_MONOTONIC,&time);
         enqueue(&commands_per_server[status.MPI_SOURCE * MAX_COMMAND_LENGTH],time,FINISHED);
 
         sprintf(output_path,"output_client%d.txt",occupied_servers[status.MPI_SOURCE]);
-        if((out = fopen(output_path,"a")) == NULL){
-            perror("opening output");
-            MPI_Abort(MPI_COMM_WORLD,1);
-        }
+
 
         switch(status.MPI_TAG){
             case PRIMES:
             case PRIMEDIVISORS:
                 MPI_Recv(&result,1,MPI_INT,status.MPI_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-                fprintf(out,"%d\n",result);
                 break;
             case ANAGRAMS:
 //                MPI_Get_count(&status,MPI_INT,&count);
-//                printf("anagram count %ld\n",status._ucount);
                 anagrams_result = (char*)malloc(status._ucount + 1);
                 MPI_Recv(anagrams_result,status._ucount,MPI_CHAR,status.MPI_SOURCE,MPI_ANY_TAG,MPI_COMM_WORLD,MPI_STATUS_IGNORE);
-                anagrams_result[status._ucount] = '\0';
-                fprintf(out,"%s\n",anagrams_result);
-                free(anagrams_result);
+                anagrams_result[status._ucount] = '\0';                
                 break;
         }
         
         occupied_servers[status.MPI_SOURCE] = -1;
         sem_post(&sem);
+
+        if((out = fopen(output_path,"a")) == NULL){
+            perror("opening output");
+            MPI_Abort(MPI_COMM_WORLD,1);
+        }
+        if(status.MPI_TAG == PRIMES || status.MPI_TAG == ANAGRAMS){
+            fprintf(out,"%d\n",result);
+        }
+        else{
+            fprintf(out,"%s\n",anagrams_result);
+            free(anagrams_result);
+        }
+
         fclose(out);
         sem_getvalue(&sem,&sem_value);
     }
@@ -223,6 +234,7 @@ void *receive_results(void *arg){
 
     return NULL;
 }
+
 
 void send_request(server_request request, MPI_Datatype MPI_server_request,int client_id,char original_command[]){
     sem_wait(&sem);
@@ -372,7 +384,91 @@ void worker_server(MPI_Datatype MPI_server_request,int my_rank){
             MPI_Send(&result,1,MPI_INT,0,request.type,MPI_COMM_WORLD);
 
     }
+}
 
+void serial_job_dispatcher(FILE *f, FILE *log_file, double time_start){
+    char command[MAX_COMMAND_LENGTH],original_command[MAX_COMMAND_LENGTH],output_path[100];
+    char *token,*request_type,*request_argument,*anagrams_result;
+    int sleep_amount;        
+    struct timespec time;
+    double time_double;
+    int n;
+    FILE *out;
+    
+
+    while(fgets(command,49,f) != NULL){
+        clock_gettime(CLOCK_MONOTONIC,&time);
+
+        if(strcmp(command,"\n") == 0)
+            continue;
+
+        command[strlen(command)-1] = '\0';
+        strcpy(original_command,command);
+        
+        token = strtok(command," ");
+        if(strcmp(token, "WAIT") == 0){
+            token =  strtok(NULL," ");
+            sleep_amount = atoi(token);
+            sleep(sleep_amount);
+        }
+        else{
+            time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+            time_double -= time_start;  
+            fprintf(log_file,"%f: %s RECEIVED\n",time_double,original_command);
+            request_type = strtok(NULL," ");
+            request_argument = strtok(NULL, " ");
+            
+            sprintf(output_path,"output_client_serial%d.txt",atoi(token+3));
+            if((out = fopen(output_path,"a")) == NULL){
+                perror("opening output");
+                MPI_Abort(MPI_COMM_WORLD,1);
+            }
+            
+            if(strcmp(request_type,"PRIMES") == 0){
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;  
+                fprintf(log_file,"%f: %s STARTED\n",time_double,original_command);
+                n = primes(atoi(request_argument));
+                fprintf(out,"%d\n",n);
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;
+                fprintf(log_file,"%f: %s FINISHED\n",time_double,original_command);
+            }
+            else if(strcmp(request_type,"PRIMEDIVISORS") == 0){
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;  
+                fprintf(log_file,"%f: %s STARTED\n",time_double,original_command);
+                n = primedivisors(atoi(request_argument));
+                fprintf(out,"%d\n",n);
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;
+                fprintf(log_file,"%f: %s FINISHED\n",time_double,original_command);            
+            }
+            else if(strcmp(request_type,"ANAGRAMS") == 0){
+                request_argument[strlen(request_argument)-1] = '\0';
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;  
+                fprintf(log_file,"%f: %s STARTED\n",time_double,original_command);    
+                anagrams_result = anagrams(request_argument);
+                fprintf(out,"%s\n",anagrams_result);
+                clock_gettime(CLOCK_MONOTONIC,&time);
+                time_double = time.tv_sec + time.tv_nsec / 1000000000.0;
+                time_double -= time_start;
+                fprintf(log_file,"%f: %s FINISHED\n",time_double,original_command);
+                free(anagrams_result);
+            }
+            else{
+                printf("Unknown command %s %s %s\n",token,request_type,request_argument);
+                fflush(stdout);
+            }
+            fclose(out);
+        }
+    }
 }
 
 int main(int argc, char **argv){
@@ -408,9 +504,7 @@ int main(int argc, char **argv){
     MPI_Type_create_struct(3,block_counts,offsets,old_types,&MPI_server_request);
     MPI_Type_commit(&MPI_server_request);
 
-    if(my_rank == 0){
-        clock_gettime(CLOCK_MONOTONIC,&start);
-        time_start = start.tv_sec + start.tv_nsec / 1000000000.0;   
+    if(my_rank == 0){           
         if((f = fopen(argv[1],"r")) == NULL){
             printf("Problem opening input file\n");
             MPI_Abort(MPI_COMM_WORLD,1);
@@ -419,17 +513,42 @@ int main(int argc, char **argv){
             printf("Problem opening output file\n");
             MPI_Abort(MPI_COMM_WORLD,1);
         }
-        main_server(f,log_file,MPI_server_request);
-        fclose(f);
-        fclose(log_file);
+        clock_gettime(CLOCK_MONOTONIC,&start);
+        time_start = start.tv_sec + start.tv_nsec / 1000000000.0;
+        main_server(f,log_file,MPI_server_request);        
         clock_gettime(CLOCK_MONOTONIC,&finish);
         total_time = (finish.tv_sec - start.tv_sec);
         total_time += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
-        printf("Parallel time: %f\n",total_time);
+        printf("Parallel time: %f\n",total_time);        
+        fclose(f);
+        fclose(log_file);
     }
     else
         worker_server(MPI_server_request,my_rank);
 
+#ifdef SERIAL
+    if(my_rank == 0){
+        if((f = fopen(argv[1],"r")) == NULL){
+            printf("Problem opening input file\n");
+            MPI_Abort(MPI_COMM_WORLD,1);
+        }
+        if((log_file = fopen("log_serial.txt","w")) == NULL){
+            printf("Problem opening output file\n");
+            MPI_Abort(MPI_COMM_WORLD,1);
+        }
+        rewind(f);
+        clock_gettime(CLOCK_MONOTONIC,&start);
+        time_start = start.tv_sec + start.tv_nsec / 1000000000.0;
+        serial_job_dispatcher(f,log_file,time_start);
+        clock_gettime(CLOCK_MONOTONIC,&finish);
+        total_time = (finish.tv_sec - start.tv_sec);
+        total_time += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+        printf("Serial time: %f\n",total_time);        
+        fclose(f);
+        fclose(log_file);
+    }
+#endif
+    
     MPI_Type_free(&MPI_server_request);
     MPI_Finalize();
     
